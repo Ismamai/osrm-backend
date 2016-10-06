@@ -2,6 +2,7 @@
 #include "engine/api/route_parameters.hpp"
 #include "engine/engine_config.hpp"
 #include "engine/status.hpp"
+#include "engine/data_watchdog.hpp"
 
 #include "engine/plugins/match.hpp"
 #include "engine/plugins/nearest.hpp"
@@ -35,6 +36,8 @@ struct Engine::EngineLock
 {
     // will only be initialized if shared memory is used
     storage::SharedBarriers barrier;
+    // ensures that when we set facade we can do it without race conditions
+    std::mutex facade_update_mutex;
     // decrease number of concurrent queries
     void DecreaseQueryCount();
     // increase number of concurrent queries
@@ -86,7 +89,8 @@ namespace
 template <typename ParameterT, typename PluginT, typename ResultT>
 osrm::engine::Status
 RunQuery(const std::unique_ptr<osrm::engine::Engine::EngineLock> &lock,
-         const std::shared_ptr<osrm::engine::datafacade::BaseDataFacade> &facade,
+         osrm::engine::DataWatchdog& watchdog,
+         std::shared_ptr<osrm::engine::datafacade::BaseDataFacade> &facade,
          const ParameterT &parameters,
          PluginT &plugin,
          ResultT &result)
@@ -99,11 +103,32 @@ RunQuery(const std::unique_ptr<osrm::engine::Engine::EngineLock> &lock,
     BOOST_ASSERT(lock);
     lock->IncreaseQueryCount();
 
-    auto &shared_facade = static_cast<osrm::engine::datafacade::SharedDataFacade &>(*facade);
-    shared_facade.CheckAndReloadFacade();
-    // Get a shared data lock so that other threads won't update
-    // things while the query is running
-    boost::shared_lock<boost::shared_mutex> data_lock{shared_facade.data_mutex};
+    {
+        // this lock ensures that we are never overtaken while creating a new
+        // facade and setting it.
+        // This is important since we need to ensure there is always exactly
+        // one facade per shared memory region.
+        // TODO: Remove this once the SharedDataFacade doesn't own the shared memory
+        // segment anymore.
+        std::lock_guard<std::mutex> update_lock(lock->facade_update_mutex);
+
+        if (watchdog.HasNewRegion())
+        {
+
+            auto new_facade = watchdog.MaybeLoadNewRegion();
+            // for now the external locking will ensure that loading the new region
+            // will ways work. In the future we might allow being overtaken
+            // by other threads and they will also try to update.
+            if (new_facade)
+            {
+                // TODO remove once we allow for more then one SharedMemoryFacade at the same time
+                // at this point no other query is allowed to reference this facade!
+                // the old facade will die exactly here
+                BOOST_ASSERT(facade.use_count() == 1);
+                facade = std::move(new_facade);
+            }
+        }
+    }
 
     osrm::engine::Status status = plugin.HandleRequest(facade, parameters, result);
 
@@ -123,7 +148,16 @@ Engine::Engine(const EngineConfig &config)
     if (config.use_shared_memory)
     {
         lock = std::make_unique<EngineLock>();
-        query_data_facade = std::make_shared<datafacade::SharedDataFacade>();
+
+        if (!DataWatchdog::TryConnect())
+        {
+            throw util::exception(
+                "No shared memory blocks found, have you forgotten to run osrm-datastore?");
+        }
+
+        watchdog = std::make_unique<DataWatchdog>();
+        query_data_facade = watchdog->MaybeLoadNewRegion();
+        BOOST_ASSERT(query_data_facade);
     }
     else
     {
@@ -152,32 +186,32 @@ Engine &Engine::operator=(Engine &&) noexcept = default;
 
 Status Engine::Route(const api::RouteParameters &params, util::json::Object &result) const
 {
-    return RunQuery(lock, query_data_facade, params, *route_plugin, result);
+    return RunQuery(lock, *watchdog, query_data_facade, params, *route_plugin, result);
 }
 
 Status Engine::Table(const api::TableParameters &params, util::json::Object &result) const
 {
-    return RunQuery(lock, query_data_facade, params, *table_plugin, result);
+    return RunQuery(lock, *watchdog, query_data_facade, params, *table_plugin, result);
 }
 
 Status Engine::Nearest(const api::NearestParameters &params, util::json::Object &result) const
 {
-    return RunQuery(lock, query_data_facade, params, *nearest_plugin, result);
+    return RunQuery(lock, *watchdog, query_data_facade, params, *nearest_plugin, result);
 }
 
 Status Engine::Trip(const api::TripParameters &params, util::json::Object &result) const
 {
-    return RunQuery(lock, query_data_facade, params, *trip_plugin, result);
+    return RunQuery(lock, *watchdog, query_data_facade, params, *trip_plugin, result);
 }
 
 Status Engine::Match(const api::MatchParameters &params, util::json::Object &result) const
 {
-    return RunQuery(lock, query_data_facade, params, *match_plugin, result);
+    return RunQuery(lock, *watchdog, query_data_facade, params, *match_plugin, result);
 }
 
 Status Engine::Tile(const api::TileParameters &params, std::string &result) const
 {
-    return RunQuery(lock, query_data_facade, params, *tile_plugin, result);
+    return RunQuery(lock, *watchdog, query_data_facade, params, *tile_plugin, result);
 }
 
 } // engine ns
