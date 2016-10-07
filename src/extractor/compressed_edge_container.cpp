@@ -80,7 +80,7 @@ void CompressedEdgeContainer::SerializeInternalVector(const std::string &path) c
     BOOST_ASSERT(std::numeric_limits<unsigned>::max() != compressed_geometries);
     geometry_out_stream.write((char *)&compressed_geometries, sizeof(unsigned));
 
-    // write indices array
+    // calculate geometry count
     unsigned prefix_sum_of_list_indices = 0;
     for (const auto &elem : m_compressed_geometries)
     {
@@ -97,20 +97,50 @@ void CompressedEdgeContainer::SerializeInternalVector(const std::string &path) c
     // number of geometry entries to follow, it is the (inclusive) prefix sum
     geometry_out_stream.write((char *)&prefix_sum_of_list_indices, sizeof(unsigned));
 
-    unsigned control_sum = 0;
-    // write compressed geometries
+    unsigned node_id_control_sum = 0;
+    // write compressed geometry node id's
     for (auto &elem : m_compressed_geometries)
     {
         const std::vector<CompressedEdge> &current_vector = elem;
         const unsigned unpacked_size = current_vector.size();
-        control_sum += unpacked_size;
+        node_id_control_sum += unpacked_size;
         BOOST_ASSERT(std::numeric_limits<unsigned>::max() != unpacked_size);
         for (const auto &current_node : current_vector)
         {
-            geometry_out_stream.write((char *)&(current_node), sizeof(CompressedEdge));
+            geometry_out_stream.write((char *)&(current_node.node_id), sizeof(NodeID));
         }
     }
-    BOOST_ASSERT(control_sum == prefix_sum_of_list_indices);
+    BOOST_ASSERT(node_id_control_sum == prefix_sum_of_list_indices);
+
+    unsigned fwd_weight_control_sum = 0;
+    // write compressed geometry forward weights's
+    for (auto &elem : m_compressed_geometries)
+    {
+        const std::vector<CompressedEdge> &current_vector = elem;
+        const unsigned unpacked_size = current_vector.size();
+        fwd_weight_control_sum += unpacked_size;
+        BOOST_ASSERT(std::numeric_limits<unsigned>::max() != unpacked_size);
+        for (const auto &current_node : current_vector)
+        {
+            geometry_out_stream.write((char *)&(current_node.forward_weight), sizeof(EdgeWeight));
+        }
+    }
+    BOOST_ASSERT(fwd_weight_control_sum == prefix_sum_of_list_indices);
+
+    unsigned rev_weight_control_sum = 0;
+    // write compressed geometry forward weights's
+    for (auto &elem : m_compressed_geometries)
+    {
+        const std::vector<CompressedEdge> &current_vector = elem;
+        const unsigned unpacked_size = current_vector.size();
+        rev_weight_control_sum += unpacked_size;
+        BOOST_ASSERT(std::numeric_limits<unsigned>::max() != unpacked_size);
+        for (const auto &current_node : current_vector)
+        {
+            geometry_out_stream.write((char *)&(current_node.reverse_weight), sizeof(EdgeWeight));
+        }
+    }
+    BOOST_ASSERT(rev_weight_control_sum == prefix_sum_of_list_indices);
 }
 
 // Adds info for a compressed edge to the container.   edge_id_2
